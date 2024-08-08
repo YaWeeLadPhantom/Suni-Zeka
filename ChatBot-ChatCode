@@ -1,0 +1,177 @@
+import azure.cognitiveservices.speech as speechsdk
+import requests
+import threading
+import queue
+import time
+
+# Configuration
+API_KEY = "d782114c41454d01a5d309b246e51855"
+SERVICE_REGION = "westeurope"
+
+# Initialize the Speech SDK
+speech_config = speechsdk.SpeechConfig(subscription=API_KEY, region=SERVICE_REGION)
+speech_config.speech_recognition_language = "az-AZ"
+speech_config.speech_synthesis_language = "az-AZ"
+speech_config.speech_synthesis_voice_name = "az-AZ-GulnarNeural"  # Example voice name
+
+# Payload for the request
+payload = {
+    "messages": [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "You are a friendly Azerbaijani language AI assistant that is hearing, speaking, and giving people information."
+                }
+            ]
+        }
+    ],
+    "temperature": 0.7,
+    "top_p": 0.95,
+    "max_tokens": 800
+}
+
+ENDPOINT = "https://aygunsun02.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview"
+HEADERS = {
+    "Content-Type": "application/json",
+    "api-key": API_KEY,
+}
+
+# Queue for storing recognized speech text
+text_queue = queue.Queue()
+stop_flag = threading.Event()
+listening_flag = threading.Event()
+
+def recognize_speech_async():
+    def recognized_callback(evt):
+        # This is called when recognized text is available
+        print(f"Recognized: {evt.result.text}")
+        if evt.result.text:
+            text_queue.put(evt.result.text)
+            listening_flag.clear()
+
+    def session_stopped_callback(evt):
+        print("Session stopped.")
+        stop_flag.set()
+
+    def canceled_callback(evt):
+        print(f"CANCELED: Reason={evt.reason}")
+        if evt.reason == speechsdk.CancellationReason.Error:
+            print(f"ErrorDetails={evt.error_details}")
+        stop_flag.set()
+
+    try:
+        audio_config = speechsdk.audio.AudioConfig(use_default_microphone=True)
+        recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config, audio_config=audio_config)
+
+        recognizer.recognized.connect(recognized_callback)
+        recognizer.session_stopped.connect(session_stopped_callback)
+        recognizer.canceled.connect(canceled_callback)
+        recognizer.start_continuous_recognition()
+        print("Speech recognition started.")
+    except Exception as e:
+        print(f"An error occurred during speech recognition setup: {e}")
+        stop_flag.set()
+
+    return recognizer
+
+def stop_recognition(recognizer):
+    try:
+        recognizer.stop_continuous_recognition()
+        print("Stopping speech recognition.")
+    except Exception as e:
+        print(f"An error occurred while stopping recognition: {e}")
+    finally:
+        stop_flag.set()
+
+def text_to_speech(text):
+    audio_config = speechsdk.audio.AudioOutputConfig(use_default_speaker=True)
+    synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+
+    try:
+        result = synthesizer.speak_text(text)
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            print("Synthesis completed successfully.")
+        else:
+            print(f"Speech Synthesis failed: {result.reason}")
+    except Exception as e:
+        print(f"An error occurred during speech synthesis: {e}")
+
+def send_message(message):
+    payload["messages"].append({
+        "role": "user",
+        "content": [{"type": "text", "text": message}]
+    })
+    try:
+        response = requests.post(ENDPOINT, headers=HEADERS, json=payload)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        raise SystemExit(f"Failed to make the request. Error: {e}")
+
+def handle_conversation():
+    while not stop_flag.is_set():
+        if not text_queue.empty():
+            user_text = text_queue.get()
+            if user_text.lower() == 'exit':
+                print("Ending conversation.")
+                stop_flag.set()
+                break
+
+            # Send user text to the AI
+            response_data = send_message(user_text)
+            assistant_message = response_data['choices'][0]['message']['content']
+
+            # Print the assistant's response
+            print("Assistant's Response:", assistant_message)
+
+            # Convert the assistant's response to speech and play it
+            text_to_speech(assistant_message)
+
+def handle_unrecognized_input():
+    while not stop_flag.is_set():
+        if listening_flag.is_set():
+            print("Sorry, I didn't catch that. Could you please repeat?")
+            text_to_speech("Sorry, I didn't catch that. Could you please repeat?")
+        time.sleep(4)
+
+def main():
+    # Prompt user for input type
+    input_type = input("Enter 'voice' for voice input or 'text' for text input: ").strip().lower()
+
+    if input_type == 'voice':
+        print("Listening for voice input...")
+        # Start the continuous speech recognition in a separate thread
+        recognizer = recognize_speech_async()
+
+        # Start the threads for handling conversation and unrecognized input
+        recognition_thread = threading.Thread(target=handle_conversation)
+        unrecognized_input_thread = threading.Thread(target=handle_unrecognized_input)
+        recognition_thread.start()
+        unrecognized_input_thread.start()
+
+        recognition_thread.join()  # Wait for the conversation handling to complete
+        stop_recognition(recognizer)
+        unrecognized_input_thread.join()
+    elif input_type == 'text':
+        while True:
+            user_text = input("Enter your text (type 'exit' to quit): ").strip()
+            if user_text.lower() == 'exit':
+                print("Ending conversation.")
+                break
+
+            # Send user text to the AI
+            response_data = send_message(user_text)
+            assistant_message = response_data['choices'][0]['message']['content']
+
+            # Print the assistant's response
+            print("Assistant's Response:", assistant_message)
+
+            # Convert the assistant's response to speech and play it
+            text_to_speech(assistant_message)
+    else:
+        print("Invalid input type. Please enter 'voice' or 'text'.")
+
+if __name__ == "__main__":
+    main()
